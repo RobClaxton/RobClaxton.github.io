@@ -7,5 +7,9 @@ This is a Quarto website.
 To learn more about Quarto websites visit <https://quarto.org/docs/websites>.
 
 ```{r}
-1 + 1
+library(leaflet)
+leaflet() %>%
+  setView(lng = 1.18, lat = 52.94, zoom = 11.5) %>%
+  addTiles()
+
 ```
