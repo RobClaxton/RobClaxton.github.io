@@ -2,14 +2,864 @@
 title: "seasearch"
 ---
 
-This is a Quarto website.
-
-To learn more about Quarto websites visit <https://quarto.org/docs/websites>.
-
-```{r}
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message=FALSE,error=FALSE,warning=FALSE)
+library(readODS)
+library(dplyr)
+library(purrr)
+library(sf)
 library(leaflet)
+library(biogeo)
+library(geosphere)
+library(lwgeom)
+library(assertthat)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+```
+
+```{r read_spreadsheets}
+tracks <-
+  list.files(path = 'SeasearchTracksAndReports/', pattern = '*.ods', full.names=TRUE) %>%
+  map_df(
+    ~read_ods(
+      .,
+      sheet = 1,
+      col_names = TRUE,
+      col_types = NULL,
+      na = "",
+      skip = 1,
+      formula_as_formula = FALSE,
+      range = NULL,
+      row_names = FALSE,
+      strings_as_factors = FALSE,
+      verbose = FALSE
+    )
+  )
+```
+
+Rename the lat/long columns so we don't have duplicate names. Also rename distance column.
+
+```{r rename_columns}
+
+names(tracks)[8] = "lat_start"
+names(tracks)[9] = "long_start"
+names(tracks)[10] = "lat_turn"
+names(tracks)[11] = "long_turn"
+names(tracks)[12] = "lat_end"
+names(tracks)[13] = "long_end"
+names(tracks)[14] = "lat_centre"
+names(tracks)[15] = "long_centre"
+names(tracks)[17] = "distance"
+```
+
+```{r convert_cardinal_to_heading}
+dir <- setNames(
+  seq(0, 337.5 , by = 22.5),
+  c(
+    "E",
+    "ENE",
+    "NE",
+    "NNE",
+    "N",
+    "NNW",
+    "NW",
+    "WNW",
+    "W",
+    "WSW",
+    "SW",
+    "SSW",
+    "S",
+    "SSE",
+    "SE",
+    "ESE"
+  )
+)
+
+tracks$heading = dir[tracks$direction]
+```
+
+## Add the metadata columns
+
+```{r add_columns}
+tracks = tracks %>%
+  mutate(lfg=if_else(is.na(`Lost fishing gear`),0,1)) %>%
+  mutate(afg=if_else(is.na(`Live fishing gear`),0,1)) %>%
+  mutate(la=if_else(is.na(`Lost angling`),0,1)) %>%
+  mutate(cc=if_else(is.na(`Cooked crab`),0,1)) %>%
+  mutate(cd=if_else(is.na(`chalk damage`),0,1)) %>%
+  mutate(other=if_else(is.na(`other`),0,1)) %>%
+  mutate(chalkp=if_else(is.na(`Chalk present`),0,1)) %>%
+  mutate(clayp=if_else(is.na(`Clay present`),0,1))
+```
+
+## Utility functions
+
+```{r utilities}
+make_line <- function(lat_start_dm,
+                      long_start_dm,
+                      lat_end_dm,
+                      long_end_dm) {
+  
+  st_linestring(matrix(c(long_start_dm,
+                         long_end_dm,
+                         lat_start_dm,
+                         lat_end_dm), 2, 2))
+}
+
+make_point = function(lat_centre_dm,
+                      long_centre_dm)
+{
+  st_point(c(long_centre_dm,
+             lat_centre_dm))
+}
+
+make_sf = function(sfc, dt)
+{
+  st_sf(
+    i = 1:length(sfc),
+    id = dt$`Form No`,
+    lfg = dt$lfg,
+    afg = dt$afg,
+    la = dt$la,
+    cc = dt$cc,
+    cd = dt$cd,
+    other = dt$other,
+    chalkp = dt$chalkp,
+    clayp = dt$clayp,
+    geom = sfc
+  )
+}
+
+# df %>%
+#     select(X, Y, prevXval, prevYval) %>% 
+#     pmap(make_line) %>% 
+#     st_as_sfc(crs = 4326) %>% 
+#     {cbind(df, geom = .)} %>% 
+#     st_sf() 
+
+```
+
+## Correct corrupt positions
+
+```{r correct_data}
+## START END
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_end=replace(long_end, long_end=="13.600E", "01 13.600E")) %>%
+     as.data.frame()
+
+## START-DIRECTION
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_start=replace(lat_start, lat_start=="52 56.965", "52 56.965N")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_start=replace(lat_start, lat_start=="5257.410N", "52 57.410N")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_start=replace(long_start, long_start=="01 05.785", "01 05.785E")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_start=replace(long_start, long_start=="12.527E", "01 12.527E")) %>% as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>% mutate(long_start=replace(long_start, long_start=="02 12.626E", "01 12.626E")) %>% as.data.frame()
+
+## START-TURN
+# fix incorrect latitude
+tracks$lat_turn[which(tracks$`Form No`=='EA17/015')]="52 56.108N"
+# drop unfixable record with corrupt longitude
+tracks = tracks %>%
+  filter(`Form No` != "EA19/109")  # long_turn = 52 56.732
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_turn=replace(long_turn, long_turn=="O1 20.400E", "01 20.400E")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_start=replace(long_start, long_start=="O1 20.400E", "01 20.400E")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_start=replace(long_start, long_start=="01 06.521E", "01 16.521E")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_start=replace(long_start, long_start=="01 06.518E", "01 16.518E")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_start=replace(long_start, long_start=="02 03.089E", "01 03.089E")) %>%
+     as.data.frame()
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_turn=replace(long_turn, long_turn=="1 20.904E", "01 20.904E")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_start=replace(lat_start, lat_start=="52 56.301", "52 56.301N")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_start=replace(lat_start, lat_start=="52 57.993", "52 57.993N")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_start=replace(lat_start, lat_start=="57 57.950N", "52 57.950N")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_start=replace(lat_start, lat_start=="52.55.072N", "52 55.072N")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_turn=replace(lat_turn, lat_turn=="2 57.174N", "52 57.174N")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+# this one might have been intended as 57.089, need to check with Dawn
+tracks = tracks %>%
+  filter(`Form No`!="EA15/010") # lat_start = 52 56.089N
+
+## CENTRE
+# fix for record with corrupt longitude
+tracks = tracks %>%
+     mutate(long_centre=replace(long_centre, long_centre=="01 08.019", "01 08.019E")) %>%
+     as.data.frame()
+# fix for record with corrupt latitude
+tracks = tracks %>%
+     mutate(lat_centre=replace(lat_centre, lat_centre=="57 57.085N", "52 57.085N")) %>%
+     as.data.frame()
+```
+
+
+## Convert dive date
+
+```{r date_conv}
+# three date formats in use
+#   20/08/2012: grepl("^[0123][0-9]/[01][0-9]/20[0-9][0-9]$","30/12/2017")
+#   20/08/12: grepl("^[0123][0-9]/[01][0-9]/[0-9][0-9]$","30/01/17")
+#   20-Aug-12: grepl("^[0123][0-9]-[A-Z][a-z][a-z]-[0-9][0-9]$","01-Aug-07")
+
+tracks=tracks %>%
+  mutate(date.pos = case_when(
+    grepl("^[0123][0-9]/[01][0-9]/20[0-9][0-9]$", Date) ~
+      as.POSIXct(strptime(Date, "%d/%m/%Y"), tz = "utc"),
+    
+    grepl("^[0123][0-9]/[01][0-9]/[0-9][0-9]$", Date) ~
+      as.POSIXct(strptime(Date, "%d/%m/%y"), tz = "utc"),
+    
+    grepl("^[0123][0-9]-[A-Z][a-z][a-z]-[0-9][0-9]$", Date) ~
+      as.POSIXct(strptime(Date, "%d-%b-%y"), tz = "utc")
+  ))
+
+
+```
+
+## Construct dive tracks
+
+### Start-end Dives
+
+```{r start_end}
+
+dt = tracks %>% filter(!is.na(lat_start) & !is.na(long_start) & !is.na(lat_end) & !is.na(long_end))
+# fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_end=replace(long_end, long_end=="13.600E", "01 13.600E")) %>%
+#      as.data.frame()
+
+dt = dt %>% mutate(lat_start_dm=(dmsparsefmt(lat_start, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(long_start_dm=(dmsparsefmt(long_start, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(lat_end_dm=(dmsparsefmt(lat_end, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(long_end_dm=(dmsparsefmt(long_end, fmt="dd m.mmmL")$decdeg))
+
+dt_sfc=dt %>%
+    select(lat_start_dm, long_start_dm, lat_end_dm, long_end_dm) %>% 
+    pmap(make_line) %>% 
+    st_as_sfc(crs = 4326)
+
+start_end_sf = make_sf(dt_sfc, dt)
+
+# start_end_sf = st_sf(
+#   i = 1:length(dt_sfc),
+#   lfg = dt$lfg,
+#   afg = dt$afg,
+#   la = dt$la,
+#   geom = dt_sfc
+# )
+```
+
+### Start-direction Dives
+
+```{r start_direction, eval=TRUE}
+dt = tracks %>% filter(!is.na(lat_start) & !is.na(long_start) & !is.na(distance) & !is.na(heading))
+
+# fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_start=replace(lat_start, lat_start=="52 56.965", "52 56.965N")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_start=replace(lat_start, lat_start=="5257.410N", "52 57.410N")) %>%
+#      as.data.frame()
+# 
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_start=replace(long_start, long_start=="01 05.785", "01 05.785E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_start=replace(long_start, long_start=="12.527E", "01 12.527E")) %>% as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>% mutate(long_start=replace(long_start, long_start=="02 12.626E", "01 12.626E")) %>% as.data.frame()
+
+dt = dt %>% mutate(lat_start_dm=(dmsparsefmt(lat_start, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(long_start_dm=(dmsparsefmt(long_start, fmt="dd m.mmmL")$decdeg))
+
+dt[c('lat_end_dm','long_end_dm')]=destPoint(cbind(dt$lat_start_dm,dt$long_start_dm), dt$heading, dt$distance)
+
+dt_sfc=dt %>%
+    select(lat_start_dm, long_start_dm, lat_end_dm, long_end_dm) %>% 
+    pmap(make_line) %>% 
+    st_as_sfc(crs = 4326)
+
+start_direction_sf = make_sf(dt_sfc, dt)
+
+# start_direction_sf = st_sf(
+#   i = 1:length(dt_sfc),
+#   lfg = dt$lfg,
+#   afg = dt$afg,
+#   la = dt$la,
+#   geom = dt_sfc
+# )
+
+```
+
+### Start-turn Dives
+
+```{r start_turn, eval=TRUE}
+dt = tracks %>% filter(!is.na(lat_start) & !is.na(long_start) & !is.na(lat_turn) & !is.na(long_turn) )
+# # drop unfixable record with corrupt longitude
+# dt = dt %>%
+#   filter(long_turn != "52 56.732")
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_turn=replace(long_turn, long_turn=="O1 20.400E", "01 20.400E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_start=replace(long_start, long_start=="O1 20.400E", "01 20.400E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_start=replace(long_start, long_start=="01 06.521E", "01 16.521E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_start=replace(long_start, long_start=="01 06.518E", "01 16.518E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_start=replace(long_start, long_start=="02 03.089E", "01 03.089E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_turn=replace(long_turn, long_turn=="1 20.904E", "01 20.904E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_start=replace(lat_start, lat_start=="52 56.301", "52 56.301N")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_start=replace(lat_start, lat_start=="52 57.993", "52 57.993N")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_start=replace(lat_start, lat_start=="57 57.950N", "52 57.950N")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_start=replace(lat_start, lat_start=="52.55.072N", "52 55.072N")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_turn=replace(lat_turn, lat_turn=="2 57.174N", "52 57.174N")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# # this one might have been intended as 57.089, need to check with Dawn
+# dt = dt %>%
+#   filter(lat_start!="52 56.089N")
+
+dt = dt %>% mutate(lat_start_dm=(dmsparsefmt(lat_start, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(long_start_dm=(dmsparsefmt(long_start, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(lat_end_dm=(dmsparsefmt(lat_turn, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(long_end_dm=(dmsparsefmt(long_turn, fmt="dd m.mmmL")$decdeg))
+
+# need to generalise the make_line function to cope with the input column names
+dt_sfc = dt %>%
+    select(lat_start_dm, long_start_dm, lat_end_dm, long_end_dm) %>% 
+    pmap(make_line) %>% 
+    st_as_sfc(crs = 4326)
+
+start_turn_sf = make_sf(dt_sfc, dt)
+
+# start_turn_sf = st_sf(
+#   i = 1:length(dt_sfc),
+#   lfg = dt$lfg,
+#   afg = dt$afg,
+#   la = dt$la,
+#   geom = dt_sfc
+# )
+```
+
+### Centre-only Dives
+
+```{r centre, eval=TRUE}
+dt = tracks %>% filter(!is.na(lat_centre) & !is.na(long_centre))
+
+# # fix for record with corrupt longitude
+# dt = dt %>%
+#      mutate(long_centre=replace(long_centre, long_centre=="01 08.019", "01 08.019E")) %>%
+#      as.data.frame()
+# # fix for record with corrupt latitude
+# dt = dt %>%
+#      mutate(lat_centre=replace(lat_centre, lat_centre=="57 57.085N", "52 57.085N")) %>%
+#      as.data.frame()
+
+dt = dt %>% mutate(lat_centre_dm=(dmsparsefmt(lat_centre, fmt="dd m.mmmL")$decdeg))
+dt = dt %>% mutate(long_centre_dm=(dmsparsefmt(long_centre, fmt="dd m.mmmL")$decdeg))
+
+dt_sfc = dt %>%
+    select(lat_centre_dm, long_centre_dm) %>% 
+    pmap(make_point) %>% 
+    st_as_sfc(crs = 4326)
+
+centre_sf = make_sf(dt_sfc, dt)
+
+# centre_sf = st_sf(
+#   i = 1:length(dt_sfc),
+#   lfg = dt$lfg,
+#   afg = dt$afg,
+#   la = dt$la,
+#   geom = dt_sfc
+# )
+```
+
+## Create the map polygons
+
+```{r create_polygons, eval=TRUE}
+# aggregate the various geoms
+
+lines = bind_rows(start_direction_sf,
+                  start_end_sf,
+                  start_turn_sf,
+                  centre_sf)
+
+# make a grid based on bbox and join with linestrings
+bbox = st_bbox(lines)
+p1 = rbind(
+  c(bbox$xmin, bbox$ymin),
+  c(bbox$xmax, bbox$ymin),c(bbox$xmax, bbox$ymax),
+  c(bbox$xmin, bbox$ymax),
+  c(bbox$xmin, bbox$ymin)
+)
+pol = st_polygon(list(p1)) # may need to add CRS here
+g = st_make_grid(pol, cellsize = c(.0005,.0003109), square = TRUE)
+#g = st_make_grid(pol, cellsize = c(.0003030303,0.0002694946), square = TRUE)
+grid = st_sf(i=1:length(g), geom=g)
+st_crs(grid) = 4326
+
+
+j=st_join(grid,lines, left=TRUE)
+j = subset(j,!is.na(i.y))
+j = j %>%
+  group_by(i.x) %>%
+  summarise(values = n(),
+            lfg = sum(lfg),
+            afg = sum(afg),
+            la = sum(la),
+            cc = sum(cc),
+            cd = sum(cd),
+            other = sum(other),
+            chalkp = sum(chalkp),
+            clayp = sum(clayp)) %>%
+  dplyr::select(values, lfg, afg, la, cc, cd, other, chalkp, clayp, geom)
+
+```
+
+## Summarise counts for charting
+
+```{r summarise}
+summary = tracks %>% group_by(year = year(date.pos)) %>%
+  summarise(
+            all_dives=n(),
+            lost_fishing_gear = sum(lfg),
+            live_fishing_gear = sum(afg),
+            lost_angling_gear = sum(la),
+            cooked_crab = sum(cc),
+            chalk_damage = sum(cd),
+            other = sum(other),
+            chalk_present = sum(chalkp),
+            clay_present = sum(clayp))
+
+# reshape to long form
+summary_wide=gather(summary, type, value, all_dives:clay_present, factor_key=TRUE)
+
+#names(summary_wide)=c('All dives','Lost gear','Active gear','Lost angling', 'Cooked crab','Chalk damage','Other','Chalk present','Clay present')
+
+pdf(file="counts.pdf",width=10,height=10)
+ggplot(summary_wide) + 
+  geom_col(aes(x=year,y=value),fill="#cc1111") +
+  facet_wrap(summary_wide$type) +
+  theme_minimal() +
+  theme(axis.text=element_text(size=8),panel.spacing = unit(2, "lines"))
+dev.off()
+```
+
+## Visualise map with leaflet
+
+```{r using_leaflet, eval=TRUE}
+#pal <- colorNumeric("YlOrRd", domain = j$values)
+
+
+# add mcz
+mcz = st_read(dsn ="Marine_Conservation_Zones_England.shp") %>%
+  filter(mcz_name=="Cromer Shoal Chalk Beds")
+
+mcz = st_transform(mcz, 4326)
+
+# these boundaries look like they use the low tide mark so the clipping of the
+# dive site polygons is a little aggressive. COuld maybe do a -ve buffer operation
+# to trim them or use some better boundaries!
+ea = st_read("county_region.shp") %>%
+  filter(NAME=="Norfolk County" | NAME=="Suffolk County") 
+ea = st_union(st_transform(ea, 4326))
+#ea = ea %>% dplyr::select(NAME,geometry)
+j = st_difference(j,ea)
+
+palRaster <- colorNumeric("plasma", domain = j$values)
+
+bins = c(1,2,5,10,20,50,1000)
+# for counts - turn a count of 0 to NA and map NA to transparent
+j$lfg = replace(j$lfg, which(j$lfg==0), NA)
+palLfg <- colorNumeric("Reds", domain= j$lfg, na.color="#ffffff00")
+palLfg <- colorBin("Reds", bins=bins,domain= j$lfg, na.color="#ffffff00")
+
+j$afg = replace(j$afg, which(j$afg==0), NA)
+palAfg <- colorNumeric("Greys", domain= j$afg, na.color="#ffffff00")
+palAfg <- colorBin("Greys", bins=bins,domain= j$afg, na.color="#ffffff00")
+
+j$la = replace(j$la, which(j$la==0), NA)
+palLa <- colorNumeric("Oranges", domain= j$la, na.color="#ffffff00")
+palLa <- colorBin("Oranges", bins=bins,domain= j$la, na.color="#ffffff00")
+
+j$cc = replace(j$cc, which(j$cc==0), NA)
+palCc <- colorNumeric("Purples", domain= j$cc, na.color="#ffffff00")
+palCc <- colorBin("Purples", bins=bins,domain= j$cc, na.color="#ffffff00")
+
+j$cd = replace(j$cd, which(j$cd==0), NA)
+palCd <- colorNumeric("Blues", domain= j$cd, na.color="#ffffff00")
+palCd <- colorBin("Blues", bins=bins,domain= j$cd, na.color="#ffffff00")
+
+j$other = replace(j$other, which(j$other==0), NA)
+palOther <- colorNumeric("Purples", domain= j$other, na.color="#ffffff00")
+palOther <- colorBin("Purples", bins=bins,domain= j$other, na.color="#ffffff00")
+
+j$chalkp = replace(j$chalkp, which(j$chalkp==0), NA)
+palChalkp <- colorNumeric("Reds", domain= j$chalkp, na.color="#ffffff00")
+palChalkp <- colorBin("Reds", bins=bins,domain= j$chalkp, na.color="#ffffff00")
+
+j$clayp = replace(j$clayp, which(j$clayp==0), NA)
+palClayp <- colorNumeric("Greys", domain= j$clayp, na.color="#ffffff00")
+palClayp <- colorBin("Greys", bins=bins,domain= j$clayp, na.color="#ffffff00")
+
+library(pins)
+pin = board_folder("C:/Users/Rob/Documents/Pins",versioned = TRUE)
+pin %>% pin_write(j,name ="SeaSearchDiveTracks",metadata = list(src="DiveTracks.Rmd"))
+
+map=leaflet() %>%
+  setView(lng = 1.18, lat = 52.94, zoom = 13) %>%
+  addTiles() %>%
+  addPolygons(data = mcz,
+              group = "Cromer Shoals MCZ",
+              stroke = FALSE,
+              layerId = 1) %>%
+  
+  addPolygons(
+    data=subset(j,!is.na(j$lfg)),
+    group = "Lost fishing gear",
+    label = subset(j,!is.na(j$lfg))$lfg,
+    fillColor = ~ palLfg(lfg),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 3
+  ) %>%
+    addPolygons(
+    data=subset(j,!is.na(j$afg)),
+    group = "Live fishing gear",
+    label = subset(j,!is.na(j$afg))$afg,
+    fillColor = ~ palAfg(afg),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 4
+  ) %>%
+  addPolygons(
+    data=subset(j,!is.na(j$la)),
+    group = "Lost angling gear",
+    label = subset(j,!is.na(j$la))$la,
+    fillColor = ~ palLa(la),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 5
+  ) %>%
+  addPolygons(
+    data=subset(j,!is.na(j$cc)),
+    group = "Cooked crab waste",
+    label = subset(j,!is.na(j$cc))$cc,
+    fillColor = ~ palCc(cc),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 6
+  ) %>%
+  addPolygons(
+    data=subset(j,!is.na(j$cd)),
+    group = "Chalk damage 2019/20",
+    label = subset(j,!is.na(j$cd))$cd,
+    fillColor = ~ palCd(cd),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 7
+  ) %>%
+   addPolygons(
+    data=subset(j,!is.na(j$chalkp)),
+    group = "Chalk present",
+    label = subset(j,!is.na(j$chalkp))$chalkp,
+    fillColor = ~ palChalkp(chalkp),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 8
+  ) %>%
+   addPolygons(
+    data=subset(j,!is.na(j$clayp)),
+    group = "Clay present",
+    label = subset(j,!is.na(j$clayp))$clayp,
+    fillColor = ~ palClayp(clayp),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 9
+  ) %>%
+   addPolygons(
+    data=subset(j,!is.na(j$other)),
+    group = "Other litter",
+    label = subset(j,!is.na(j$other))$other,
+    fillColor = ~ palOther(other),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 10
+  ) %>%
+  addPolygons(
+    data=j,
+    group = "All dives",
+    label = j$values,
+    fillColor = ~ palRaster(values),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 2
+  ) %>%
+  addLayersControl(
+    baseGroups = c("All dives",
+                   "Lost fishing gear",
+                   "Live fishing gear",
+                   "Lost angling gear",
+                   "Cooked crab waste",
+                   "Chalk damage 2019/20",
+                   "Chalk present",
+                   "Clay present",
+                   "Other litter"),
+    overlayGroups = c("Cromer Shoals MCZ"),
+    options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+  addLegend(pal = palRaster,
+            values = j$values,
+            title = "# Dives") %>%
+  addMeasure(
+    primaryLengthUnit = "meters",
+    primaryAreaUnit = "sqmeters"
+  ) %>%
+  addScaleBar(position = "bottomleft",
+              options = scaleBarOptions(metric = TRUE)
+  )
+
+map
+  
+library(htmlwidgets)
+#saveWidget(map, file="map.html")
+
+```
+
+
+```{r generate_geopackage}
+st_write(j %>%
+           select(values, geom) %>%
+           rename(count=values) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='all_dives',
+         delete_dsn = TRUE)
+
+st_write(j %>%
+           select(lfg, geom) %>%
+           rename(count=lfg) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='lost_fishing_gear',
+         append=TRUE)
+
+st_write(j %>%
+           select(afg, geom) %>%
+           rename(count=afg) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='live_fishing_gear',
+         append=TRUE)
+
+st_write(j %>%
+           select(la, geom) %>%
+           rename(count=la) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='lost_angling_gear',
+         append=TRUE)
+
+st_write(j %>%
+           select(cc, geom) %>%
+           rename(count=cc) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='cooked_crab',
+         append=TRUE)
+
+st_write(j %>%
+           select(cd, geom) %>%
+           rename(count=cd) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='chalk_damage',
+         append=TRUE)
+
+st_write(j %>%
+           select(other, geom) %>%
+           rename(count=other) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='other',
+         append=TRUE)
+
+st_write(j %>%
+           select(chalkp, geom) %>%
+           rename(count=chalkp) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='chalk_present',
+         append=TRUE)
+
+st_write(j %>%
+           select(clayp, geom) %>%
+           rename(count=clayp) %>%
+           mutate(count=as.integer(count)) %>% 
+           na.omit(count),
+         dsn="SeaSearchEastDiveTracks.gpkg",
+         layer='clay_present',
+         append=TRUE)
+
+```
+
+
+
+```{r eval=FALSE}
 leaflet() %>%
   setView(lng = 1.18, lat = 52.94, zoom = 11.5) %>%
-  addTiles()
+  addTiles() %>%
+  addPolygons(data = mcz,
+              group = "Cromer Shoals MCZ",
+              stroke = FALSE,
+              layerId = 1) %>%
+  addPolygons(
+    data=subset(j,!is.na(j$cc)),
+    group = "Cooked crab",
+    label = subset(j,!is.na(j$cc))$cc,
+    fillColor = ~ palCc(cc),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 6
+  ) %>%
+  addPolygons(
+    data=j,
+    group = "all dives",
+    label = j$values,
+    fillColor = ~ palRaster(values),
+    fillOpacity = 0.75,
+    stroke = FALSE,
+    layerId = 2
+  ) %>%
+  addLayersControl(
+    baseGroups = c("all dives",
+                   "Cooked crab"),
+    overlayGroups = c("Cromer Shoals MCZ"),
+    options = layersControlOptions(collapsed = FALSE)
+    )
+```
+
+
+
+## Example of creating raster from Kernel Density Estimation
+
+```{r eval=FALSE}
+d = data.frame(long=centre$long_centre_dm, lat=centre$lat_centre_dm)
+kde <- bkde2D(d,bandwidth=c(.0045, .0068), gridsize = c(1000,1000))
+
+d = data.frame(long=centre$long_centre_dm, lat=centre$lat_centre_dm)
+kde <- bkde2D(d,bandwidth=c(.01, .01), gridsize = c(1000,1000))
+# Create Raster from Kernel Density output
+KernelDensityRaster <- raster(list(x=kde$x1 ,y=kde$x2 ,z = kde$fhat))
+
+#create pal function for coloring the raster
+palRaster <- colorNumeric("Spectral", domain = KernelDensityRaster@data@values)
+
+
+## Leaflet map with raster
+leaflet() %>% addTiles() %>% 
+  addRasterImage(KernelDensityRaster, 
+                 colors = palRaster, 
+                 opacity = .8) %>%
+  addLegend(pal = palRaster, 
+            values = KernelDensityRaster@data@values, 
+            title = "Kernel Density of Points")
+
+
+KernelDensityRaster@data@values[which(KernelDensityRaster@data@values < 1)] <- NA
+
+#create pal function for coloring the raster
+palRaster <- colorNumeric("Spectral", domain = KernelDensityRaster@data@values, na.color = "transparent")
+
+## Redraw the map
+leaflet() %>% addTiles() %>% 
+  addRasterImage(KernelDensityRaster, 
+                 colors = palRaster, 
+                 opacity = .8) %>%
+  addLegend(pal = palRaster, 
+            values = KernelDensityRaster@data@values, 
+            title = "Kernel Density of Points")
 
 ```
